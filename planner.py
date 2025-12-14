@@ -25,9 +25,9 @@ import kraken_ohlc
 dry = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
 RUN_TRADE_NOW = os.getenv("RUN_TRADE_NOW", "false").lower() in {"1", "true", "yes"}
 
-SYMBOL_FUTS_UC = "PF_XBTEUR"
-SYMBOL_FUTS_LC = "pf_xbteur"
-SYMBOL_OHLC_KRAKEN = "XBTEUR"
+SYMBOL_FUTS_UC = "FF_XBTUSD_260327"
+SYMBOL_FUTS_LC = "ff_xbtusd_260327"
+SYMBOL_OHLC_KRAKEN = "XBTUSD"
 INTERVAL_KRAKEN = 1440
 
 # Strategy 1 Parameters (Tactical)
