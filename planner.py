@@ -50,7 +50,8 @@ S2_STOP_PCT = 0.27  # 27% trailing stop
 # --- Execution Settings ---
 STOP_WAIT_TIME = 600  # Seconds to wait for Limit fill (10 mins)
 LIMIT_OFFSET_PCT = 0.0002  # 0.02% "In our favor"
-MIN_TRADE_SIZE = 0.0001  # Lowered from 0.001 to allow smaller accounts (~$8 min)
+# Low threshold for test account (~$8)
+MIN_TRADE_SIZE = 0.0001  
 
 # Logging Setup
 logging.basicConfig(
@@ -238,10 +239,9 @@ def execute_delta_order(api, symbol: str, delta_size: float, current_price: floa
     abs_size = abs(delta_size)
     
     # Calculate Limit Price (0.02% in favor)
-    # Note: Kraken Futures usually requires integer/specific tick size. 
-    # For FF_XBTUSD, tick size is likely 0.1 or 1.0. We round to 1 decimal to be safe.
+    # FIX: FF_XBTUSD requires prices to be Integers (Tick Size = 1.0)
     limit_price = current_price * (1.0 - LIMIT_OFFSET_PCT) if side == "buy" else current_price * (1.0 + LIMIT_OFFSET_PCT)
-    limit_price = round(limit_price, 1)
+    limit_price = int(round(limit_price)) # Force to Integer
     
     log.info(f"EXECUTING DELTA: {side.upper()} {abs_size:.4f} @ {limit_price}")
     
@@ -256,7 +256,7 @@ def execute_delta_order(api, symbol: str, delta_size: float, current_price: floa
             "symbol": symbol,
             "side": side,
             "size": abs_size,
-            "limitPrice": limit_price
+            "limitPrice": limit_price # Integer
         }
         resp = api.send_order(order_params)
         log.info(f"Limit Order Placed: {resp}")
@@ -308,16 +308,20 @@ def manage_stop_loss_orders(api, symbol: str, current_price: float, collateral: 
     def place_stop(label, qty, stop_px):
         # Stop qty must also be valid
         if qty < MIN_TRADE_SIZE:
+            log.warning(f"{label} Qty {qty:.6f} < MIN {MIN_TRADE_SIZE}. Stop skipped (Account too small).")
             return
+        
+        # Force integer price for FF contract
+        stop_px_int = int(round(stop_px))
             
-        log.info(f"Placing {label}: Stop {side.upper()} {qty:.4f} @ {stop_px:.1f}")
+        log.info(f"Placing {label}: Stop {side.upper()} {qty:.4f} @ {stop_px_int}")
         try:
             order_params = {
                 "orderType": "stp", # Stop Loss
                 "symbol": symbol,
                 "side": side,
                 "size": qty,
-                "stopPrice": round(stop_px, 1),
+                "stopPrice": stop_px_int, # Integer
                 "reduceOnly": True
             }
             api.send_order(order_params)
