@@ -230,13 +230,15 @@ def get_market_price(api, symbol) -> float:
         return 0.0
 
 def execute_delta_order(api, symbol: str, delta_size: float, current_price: float):
-    # Check against global MIN_TRADE_SIZE
-    if abs(delta_size) < MIN_TRADE_SIZE:
-        log.info(f"Delta {delta_size:.6f} < MIN_TRADE_SIZE {MIN_TRADE_SIZE}. No trade required.")
+    # FIX: Round size to 4 decimals first to match API precision
+    abs_size = round(abs(delta_size), 4)
+    
+    # Check against global MIN_TRADE_SIZE after rounding
+    if abs_size < MIN_TRADE_SIZE:
+        log.info(f"Delta {abs_size:.4f} < MIN_TRADE_SIZE {MIN_TRADE_SIZE}. No trade required.")
         return "SKIPPED"
 
     side = "buy" if delta_size > 0 else "sell"
-    abs_size = abs(delta_size)
     
     # Calculate Limit Price (0.02% in favor)
     # FIX: FF_XBTUSD requires prices to be Integers (Tick Size = 1.0)
@@ -255,7 +257,7 @@ def execute_delta_order(api, symbol: str, delta_size: float, current_price: floa
             "orderType": "lmt",
             "symbol": symbol,
             "side": side,
-            "size": abs_size,
+            "size": abs_size, # Rounded to 4 decimals
             "limitPrice": limit_price # Integer
         }
         resp = api.send_order(order_params)
@@ -306,6 +308,9 @@ def manage_stop_loss_orders(api, symbol: str, current_price: float, collateral: 
     
     # Helper to place stop
     def place_stop(label, qty, stop_px):
+        # Round qty to 4 decimals
+        qty = round(qty, 4)
+        
         # Stop qty must also be valid
         if qty < MIN_TRADE_SIZE:
             log.warning(f"{label} Qty {qty:.6f} < MIN {MIN_TRADE_SIZE}. Stop skipped (Account too small).")
@@ -320,7 +325,7 @@ def manage_stop_loss_orders(api, symbol: str, current_price: float, collateral: 
                 "orderType": "stp", # Stop Loss
                 "symbol": symbol,
                 "side": side,
-                "size": qty,
+                "size": qty, # Rounded
                 "stopPrice": stop_px_int, # Integer
                 "reduceOnly": True
             }
@@ -415,28 +420,29 @@ def daily_trade(api):
     delta_qty = target_qty - current_qty
     log.info(f"Position: {current_qty:.4f} -> {target_qty:.4f} | Delta: {delta_qty:.4f}")
     
-    if abs(delta_qty) >= MIN_TRADE_SIZE:
-        res = execute_delta_order(api, SYMBOL_FUTS_UC, delta_qty, futs_price)
+    # Round logic is handled inside execute_delta_order, but good to check here if desired
+    # execute_delta_order handles it.
+    
+    # We call execute even if small, let it skip internally
+    res = execute_delta_order(api, SYMBOL_FUTS_UC, delta_qty, futs_price)
+    
+    if res == "CHECK_AGAIN" and not dry:
+        time.sleep(2)
+        updated_pos = get_current_net_position(api, SYMBOL_FUTS_UC)
+        rem_delta = round(target_qty - updated_pos, 4) # Round Fallback
         
-        if res == "CHECK_AGAIN" and not dry:
-            time.sleep(2)
-            updated_pos = get_current_net_position(api, SYMBOL_FUTS_UC)
-            rem_delta = target_qty - updated_pos
-            
-            if abs(rem_delta) >= MIN_TRADE_SIZE:
-                log.info(f"Fallback Market: {rem_delta:.4f}")
-                side = "buy" if rem_delta > 0 else "sell"
-                try:
-                    api.send_order({
-                        "orderType": "mkt",
-                        "symbol": SYMBOL_FUTS_UC,
-                        "side": side,
-                        "size": abs(rem_delta)
-                    })
-                except Exception as e:
-                    log.error(f"Fallback market order failed: {e}")
-    else:
-        log.info(f"Delta {abs(delta_qty):.6f} < MIN_TRADE_SIZE {MIN_TRADE_SIZE}, skipping execution.")
+        if abs(rem_delta) >= MIN_TRADE_SIZE:
+            log.info(f"Fallback Market: {rem_delta:.4f}")
+            side = "buy" if rem_delta > 0 else "sell"
+            try:
+                api.send_order({
+                    "orderType": "mkt",
+                    "symbol": SYMBOL_FUTS_UC,
+                    "side": side,
+                    "size": abs(rem_delta)
+                })
+            except Exception as e:
+                log.error(f"Fallback market order failed: {e}")
     
     # 6. Place Safety Stops
     final_net_size = get_current_net_position(api, SYMBOL_FUTS_UC)
