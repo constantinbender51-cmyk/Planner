@@ -19,7 +19,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 import numpy as np
 import pandas as pd
 
@@ -117,7 +117,7 @@ def update_trailing_stops(state: Dict, current_equity: float, s1_active: bool, s
         if current_equity > s1["peak_equity"]:
             s1["peak_equity"] = current_equity
         
-        drawdown = (s1["peak_equity"] - current_equity) / s1["peak_equity"]
+        drawdown = (s1["peak_equity"] - current_equity) / s1["peak_equity"] if s1["peak_equity"] > 0 else 0
         if drawdown > S1_STOP_PCT:
             log.warning(f"S1 STOPPED OUT (Soft Check). Drawdown: {drawdown*100:.2f}%")
             s1["stopped"] = True
@@ -132,7 +132,7 @@ def update_trailing_stops(state: Dict, current_equity: float, s1_active: bool, s
         if current_equity > s2["peak_equity"]:
             s2["peak_equity"] = current_equity
             
-        drawdown = (s2["peak_equity"] - current_equity) / s2["peak_equity"]
+        drawdown = (s2["peak_equity"] - current_equity) / s2["peak_equity"] if s2["peak_equity"] > 0 else 0
         if drawdown > S2_STOP_PCT:
             log.warning(f"S2 STOPPED OUT (Soft Check). Drawdown: {drawdown*100:.2f}%")
             s2["stopped"] = True
@@ -189,10 +189,15 @@ def get_strategy_signals(price: float, sma120: float, sma400: float, state: Dict
     return net_leverage, s1_lev, s2_lev, state
 
 def get_current_net_position(api, symbol) -> float:
+    """Fetches net position from Kraken Futures API"""
     try:
-        positions = api.get_open_positions()
+        resp = api.get_open_positions()
+        # Response format: {'result': 'success', 'openPositions': [...], ...} 
+        # OR just straight dictionary depending on API version, wrapper returns .json()
+        
+        positions = resp.get("openPositions", [])
         for p in positions:
-            if p.get('symbol') == symbol or p.get('symbol') == symbol.lower():
+            if p.get('symbol').upper() == symbol.upper():
                 size = float(p.get('size', 0.0))
                 side = p.get('side', 'long')
                 if side == 'short':
@@ -203,29 +208,68 @@ def get_current_net_position(api, symbol) -> float:
         log.error(f"Error fetching positions: {e}")
         return 0.0
 
+def get_market_price(api, symbol) -> float:
+    """Fetches mark price for the contract"""
+    try:
+        resp = api.get_tickers()
+        tickers = resp.get("tickers", [])
+        for t in tickers:
+            if t.get("symbol").upper() == symbol.upper():
+                return float(t.get("markPrice"))
+                
+        # Fallback search if exact match fails
+        for t in tickers:
+            if symbol.upper() in t.get("symbol").upper():
+                return float(t.get("markPrice"))
+        
+        raise ValueError(f"Ticker for {symbol} not found")
+    except Exception as e:
+        log.error(f"Error fetching price: {e}")
+        return 0.0
+
 def execute_delta_order(api, symbol: str, delta_size: float, current_price: float):
     if abs(delta_size) < 0.0001:
         log.info("Delta is negligible. No trade required.")
-        return
+        return "SKIPPED"
 
     side = "buy" if delta_size > 0 else "sell"
     abs_size = abs(delta_size)
+    
+    # Calculate Limit Price (0.02% in favor)
+    # Note: Kraken Futures usually requires integer/specific tick size. 
+    # For FF_XBTUSD, tick size is likely 0.1 or 1.0. We round to 1 decimal to be safe.
     limit_price = current_price * (1.0 - LIMIT_OFFSET_PCT) if side == "buy" else current_price * (1.0 + LIMIT_OFFSET_PCT)
     limit_price = round(limit_price, 1)
     
     log.info(f"EXECUTING DELTA: {side.upper()} {abs_size:.4f} @ {limit_price}")
     
     if dry:
+        log.info("[DRY RUN] Order simulated.")
         return "FILLED"
 
     try:
-        api.create_order(symbol=symbol, side=side, order_type="limit", size=abs_size, limit_price=limit_price)
-        log.info(f"Limit Order Placed. Waiting {STOP_WAIT_TIME}s...")
+        # Kraken Futures send_order
+        order_params = {
+            "orderType": "lmt",
+            "symbol": symbol,
+            "side": side,
+            "size": abs_size,
+            "limitPrice": limit_price
+        }
+        resp = api.send_order(order_params)
+        log.info(f"Limit Order Placed: {resp}")
+        
+        log.info(f"Waiting {STOP_WAIT_TIME}s for fill...")
         time.sleep(STOP_WAIT_TIME)
         
-        cancel_resp = api.cancel_all_orders(symbol=symbol)
-        if "count" in cancel_resp and cancel_resp["count"] > 0:
-            log.info("Limit order timed out. Checking status...")
+        # Check if we need to cancel (if not fully filled)
+        # We blindly cancel all orders for this symbol to ensure clean slate
+        cancel_resp = api.cancel_all_orders({"symbol": symbol})
+        
+        # If any orders were cancelled, it means we didn't fill completely
+        if cancel_resp.get("cancelStatus", {}).get("status") == "cancelled" or \
+           len(cancel_resp.get("cancelledOrders", [])) > 0:
+            log.info("Limit order timed out (partially or fully unfilled). Checking status...")
             return "CHECK_AGAIN"
         else:
             return "FILLED"
@@ -237,8 +281,6 @@ def execute_delta_order(api, symbol: str, delta_size: float, current_price: floa
 def manage_stop_loss_orders(api, symbol: str, current_price: float, collateral: float, net_size: float, s1_lev: float, s2_lev: float, state: Dict):
     """
     Calculates and places Native Stop Loss orders based on Equity Drawdown.
-    Target Equity S1 = Peak_S1 * (1 - 0.13)
-    Stop Price = Current_Price + (Target_Equity - Current_Collateral) / Net_Size
     """
     log.info("--- Managing Safety Stops ---")
     
@@ -246,10 +288,9 @@ def manage_stop_loss_orders(api, symbol: str, current_price: float, collateral: 
         log.info("[DRY RUN] Skipping stop placement.")
         return
 
-    # 1. Cancel existing stops (clean slate)
+    # 1. Cancel existing stops
     try:
-        # Note: Kraken Futures cancel_all might cancel limit orders too, but we just finished trading.
-        api.cancel_all_orders(symbol=symbol) 
+        api.cancel_all_orders({"symbol": symbol})
     except Exception as e:
         log.warning(f"Failed to cancel old stops: {e}")
 
@@ -258,48 +299,43 @@ def manage_stop_loss_orders(api, symbol: str, current_price: float, collateral: 
         log.info("Net position near zero. No stops needed.")
         return
 
-    # Determine direction
     is_long = net_size > 0
-    side = "sell" if is_long else "buy" # Stop closes position
+    side = "sell" if is_long else "buy" 
     
+    # Helper to place stop
+    def place_stop(label, qty, stop_px):
+        log.info(f"Placing {label}: Stop {side.upper()} {qty:.3f} @ {stop_px:.1f}")
+        try:
+            order_params = {
+                "orderType": "stp", # Stop Loss
+                "symbol": symbol,
+                "side": side,
+                "size": qty,
+                "stopPrice": round(stop_px, 1),
+                "reduceOnly": True
+            }
+            api.send_order(order_params)
+        except Exception as e:
+            log.error(f"Failed to place {label}: {e}")
+
     # 2. Calculate S1 Stop
     if not state["s1"]["stopped"] and abs(s1_lev) > 0.01:
         peak_s1 = state["s1"]["peak_equity"]
-        # If peak is 0 (new trade), use current collateral
         if peak_s1 == 0: peak_s1 = collateral
             
         target_eq_s1 = peak_s1 * (1 - S1_STOP_PCT)
         loss_allowance = target_eq_s1 - collateral
         
-        # Stop Price Formula: P_stop = P_curr + (Allowed_Loss / Size)
-        # If Long: Loss is negative, Size positive -> P_stop < P_curr
         stop_price_s1 = current_price + (loss_allowance / abs(net_size)) if is_long else current_price - (loss_allowance / abs(net_size))
-        
-        # Size to close: The S1 portion
         s1_qty = (collateral * abs(s1_lev)) / current_price
         
-        # Sanity check: Stop must be below price (if long)
         valid_stop = (stop_price_s1 < current_price) if is_long else (stop_price_s1 > current_price)
-        
         if valid_stop:
-            log.info(f"Placing S1 Protection: Stop {side.upper()} {s1_qty:.3f} @ {stop_price_s1:.1f}")
-            try:
-                # Trigger type usually 'stop-loss' (market) or 'stop-limit'
-                # Using stop-loss for guaranteed fill (paying taker fees is acceptable for safety)
-                api.create_order(
-                    symbol=symbol,
-                    side=side,
-                    order_type="stop", # Check API docs: usually 'stop' maps to stop-loss market
-                    size=s1_qty,
-                    stop_price=round(stop_price_s1, 1),
-                    reduce_only=True
-                )
-            except Exception as e:
-                log.error(f"Failed to place S1 stop: {e}")
+            place_stop("S1 Protection", s1_qty, stop_price_s1)
         else:
-            log.warning(f"Calculated S1 stop {stop_price_s1} is invalid (wrong side of price). Skipping.")
+            log.warning(f"Calculated S1 stop {stop_price_s1:.1f} is invalid (wrong side). Skipping.")
 
-    # 3. Calculate S2 Stop (Deeper)
+    # 3. Calculate S2 Stop
     if not state["s2"]["stopped"] and abs(s2_lev) > 0.01:
         peak_s2 = state["s2"]["peak_equity"]
         if peak_s2 == 0: peak_s2 = collateral
@@ -311,44 +347,57 @@ def manage_stop_loss_orders(api, symbol: str, current_price: float, collateral: 
         s2_qty = (collateral * abs(s2_lev)) / current_price
         
         valid_stop = (stop_price_s2 < current_price) if is_long else (stop_price_s2 > current_price)
-        
         if valid_stop:
-            log.info(f"Placing S2 Protection: Stop {side.upper()} {s2_qty:.3f} @ {stop_price_s2:.1f}")
-            try:
-                api.create_order(
-                    symbol=symbol,
-                    side=side,
-                    order_type="stop",
-                    size=s2_qty,
-                    stop_price=round(stop_price_s2, 1),
-                    reduce_only=True
-                )
-            except Exception as e:
-                log.error(f"Failed to place S2 stop: {e}")
+            place_stop("S2 Protection", s2_qty, stop_price_s2)
 
 def daily_trade(api):
     log.info("--- Starting Daily Trade Cycle ---")
     
-    # 1. Market Data
+    # 1. Market Data (Spot for Signal)
     df = kraken_ohlc.get_ohlc(SYMBOL_OHLC_KRAKEN, interval=INTERVAL_KRAKEN)
-    if df.empty: return
+    if df.empty: 
+        log.error("Failed to fetch OHLC data")
+        return
+        
     current_spot = df['close'].iloc[-1]
     sma120 = get_sma(df['close'], S1_SMA)
     sma400 = get_sma(df['close'], S2_SMA)
     
+    log.info(f"Spot: {current_spot} | SMA120: {sma120:.1f} | SMA400: {sma400:.1f}")
+    
     # 2. State & Balance
     state = load_state()
-    balances = api.get_account_balances()
-    collateral = balances.get("usd", 0) + balances.get("usdt", 0) + balances.get("usdc", 0) 
+    
+    try:
+        # Get Accounts returns: {'result': 'success', 'accounts': {'flex': {'portfolioValue': ...}}}
+        # Or similar structure. Based on planner (1).py logic:
+        accts = api.get_accounts()
+        if "accounts" in accts and "flex" in accts["accounts"]:
+            collateral = float(accts["accounts"]["flex"]["portfolioValue"])
+        else:
+            # Fallback or different structure check
+            log.warning(f"Unexpected accounts structure: {accts.keys()}")
+            # Try to print for debugging if failed
+            collateral = 0.0
+            if "accounts" in accts:
+                 # Check if it's a list or dict
+                 pass
+            raise ValueError("Could not parse portfolioValue")
+            
+    except Exception as e:
+        log.error(f"Failed to fetch balance: {e}")
+        return
+
     log.info(f"Collateral: ${collateral:.2f}")
     
-    # 3. Strategy Logic (Soft Check & Sizing)
+    # 3. Strategy Logic
     state = update_trailing_stops(state, collateral, True, True)
     target_leverage, s1_lev, s2_lev, state = get_strategy_signals(current_spot, sma120, sma400, state)
     
     # 4. Position Sizing
-    tickers = api.get_tickers(SYMBOL_FUTS_UC)
-    futs_price = tickers.get('last', current_spot)
+    futs_price = get_market_price(api, SYMBOL_FUTS_UC)
+    if futs_price == 0: futs_price = current_spot # Fallback
+    
     target_qty = (collateral * target_leverage) / futs_price
     
     # 5. Delta Execution
@@ -358,15 +407,26 @@ def daily_trade(api):
     
     if abs(delta_qty) > 0.001:
         res = execute_delta_order(api, SYMBOL_FUTS_UC, delta_qty, futs_price)
+        
         if res == "CHECK_AGAIN" and not dry:
             time.sleep(2)
-            rem_delta = target_qty - get_current_net_position(api, SYMBOL_FUTS_UC)
+            updated_pos = get_current_net_position(api, SYMBOL_FUTS_UC)
+            rem_delta = target_qty - updated_pos
+            
             if abs(rem_delta) > 0.001:
                 log.info(f"Fallback Market: {rem_delta:.4f}")
-                api.create_order(symbol=SYMBOL_FUTS_UC, side="buy" if rem_delta > 0 else "sell", order_type="market", size=abs(rem_delta))
+                side = "buy" if rem_delta > 0 else "sell"
+                try:
+                    api.send_order({
+                        "orderType": "mkt",
+                        "symbol": SYMBOL_FUTS_UC,
+                        "side": side,
+                        "size": abs(rem_delta)
+                    })
+                except Exception as e:
+                    log.error(f"Fallback market order failed: {e}")
     
-    # 6. Place Safety Stops (New)
-    # Re-fetch net size to be accurate
+    # 6. Place Safety Stops
     final_net_size = get_current_net_position(api, SYMBOL_FUTS_UC)
     manage_stop_loss_orders(api, SYMBOL_FUTS_UC, futs_price, collateral, final_net_size, s1_lev, s2_lev, state)
 
@@ -379,13 +439,20 @@ def wait_until_00_01_utc():
     now = datetime.now(timezone.utc)
     next_run = now.replace(hour=0, minute=1, second=0, microsecond=0)
     if now >= next_run: next_run += timedelta(days=1)
-    time.sleep((next_run - now).total_seconds())
+    wait_sec = (next_run - now).total_seconds()
+    log.info("Next run at 00:01 UTC (%s), sleeping %.0f s", next_run.strftime("%Y-%m-%d"), wait_sec)
+    time.sleep(wait_sec)
 
 def main():
     api_key = os.getenv("KRAKEN_API_KEY")
     api_sec = os.getenv("KRAKEN_API_SECRET")
-    if not api_key or not api_sec: sys.exit(1)
+    if not api_key or not api_sec:
+        log.error("Env vars KRAKEN_API_KEY / KRAKEN_API_SECRET missing")
+        sys.exit(1)
+
     api = kf.KrakenFuturesApi(api_key, api_sec)
+    
+    log.info("Initializing Planner (Fixed Maturity Delta-Trading)...")
     
     if RUN_TRADE_NOW:
         try: daily_trade(api)
