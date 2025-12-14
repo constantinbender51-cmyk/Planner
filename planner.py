@@ -50,6 +50,7 @@ S2_STOP_PCT = 0.27  # 27% trailing stop
 # --- Execution Settings ---
 STOP_WAIT_TIME = 600  # Seconds to wait for Limit fill (10 mins)
 LIMIT_OFFSET_PCT = 0.0002  # 0.02% "In our favor"
+MIN_TRADE_SIZE = 0.0001  # Lowered from 0.001 to allow smaller accounts (~$8 min)
 
 # Logging Setup
 logging.basicConfig(
@@ -228,8 +229,9 @@ def get_market_price(api, symbol) -> float:
         return 0.0
 
 def execute_delta_order(api, symbol: str, delta_size: float, current_price: float):
-    if abs(delta_size) < 0.0001:
-        log.info("Delta is negligible. No trade required.")
+    # Check against global MIN_TRADE_SIZE
+    if abs(delta_size) < MIN_TRADE_SIZE:
+        log.info(f"Delta {delta_size:.6f} < MIN_TRADE_SIZE {MIN_TRADE_SIZE}. No trade required.")
         return "SKIPPED"
 
     side = "buy" if delta_size > 0 else "sell"
@@ -295,7 +297,7 @@ def manage_stop_loss_orders(api, symbol: str, current_price: float, collateral: 
         log.warning(f"Failed to cancel old stops: {e}")
 
     # If hedged/neutral, stops are complex/unnecessary
-    if abs(net_size) < 0.01:
+    if abs(net_size) < MIN_TRADE_SIZE:
         log.info("Net position near zero. No stops needed.")
         return
 
@@ -304,7 +306,11 @@ def manage_stop_loss_orders(api, symbol: str, current_price: float, collateral: 
     
     # Helper to place stop
     def place_stop(label, qty, stop_px):
-        log.info(f"Placing {label}: Stop {side.upper()} {qty:.3f} @ {stop_px:.1f}")
+        # Stop qty must also be valid
+        if qty < MIN_TRADE_SIZE:
+            return
+            
+        log.info(f"Placing {label}: Stop {side.upper()} {qty:.4f} @ {stop_px:.1f}")
         try:
             order_params = {
                 "orderType": "stp", # Stop Loss
@@ -405,7 +411,7 @@ def daily_trade(api):
     delta_qty = target_qty - current_qty
     log.info(f"Position: {current_qty:.4f} -> {target_qty:.4f} | Delta: {delta_qty:.4f}")
     
-    if abs(delta_qty) > 0.001:
+    if abs(delta_qty) >= MIN_TRADE_SIZE:
         res = execute_delta_order(api, SYMBOL_FUTS_UC, delta_qty, futs_price)
         
         if res == "CHECK_AGAIN" and not dry:
@@ -413,7 +419,7 @@ def daily_trade(api):
             updated_pos = get_current_net_position(api, SYMBOL_FUTS_UC)
             rem_delta = target_qty - updated_pos
             
-            if abs(rem_delta) > 0.001:
+            if abs(rem_delta) >= MIN_TRADE_SIZE:
                 log.info(f"Fallback Market: {rem_delta:.4f}")
                 side = "buy" if rem_delta > 0 else "sell"
                 try:
@@ -425,6 +431,8 @@ def daily_trade(api):
                     })
                 except Exception as e:
                     log.error(f"Fallback market order failed: {e}")
+    else:
+        log.info(f"Delta {abs(delta_qty):.6f} < MIN_TRADE_SIZE {MIN_TRADE_SIZE}, skipping execution.")
     
     # 6. Place Safety Stops
     final_net_size = get_current_net_position(api, SYMBOL_FUTS_UC)
