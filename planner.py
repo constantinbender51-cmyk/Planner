@@ -97,8 +97,6 @@ def generate_s1_signal(df: pd.DataFrame, s1_state: Dict) -> Tuple[float, Dict]:
     prev_trend = s1_state.get('trend', 0)
     stopped = s1_state.get('stopped', False)
     entry_date = s1_state.get('entry_date', None)
-    trade_equity = s1_state.get('trade_equity', 1.0)
-    peak_equity = s1_state.get('peak_equity', 1.0)
     
     # New trend signal (crossover)
     if current_trend != prev_trend:
@@ -167,9 +165,6 @@ def generate_s2_signal(df: pd.DataFrame, s2_state: Dict) -> Tuple[float, Dict]:
     # Get previous state
     prev_trend = s2_state.get('trend', 0)
     stopped = s2_state.get('stopped', False)
-    entry_date = s2_state.get('entry_date', None)
-    trade_equity = s2_state.get('trade_equity', 1.0)
-    peak_equity = s2_state.get('peak_equity', 1.0)
     
     # New trend signal (crossover)
     if current_trend != prev_trend:
@@ -299,9 +294,7 @@ def flatten_position_market(api: kf.KrakenFuturesApi):
 
 
 def place_entry_order(api: kf.KrakenFuturesApi, net_position: float, current_price: float, collateral: float):
-    """
-    Place entry order for combined S3 position
-    """
+    """Place entry order for combined S3 position"""
     if abs(net_position) < 0.01:
         log.info("Net position near zero, no entry needed")
         return 0.0
@@ -386,7 +379,18 @@ def update_trailing_stops(df: pd.DataFrame, s1_state: Dict, s2_state: Dict,
     # Update S1 if active
     if not s1_state.get('stopped', False) and s1_state.get('trend', 0) != 0:
         s1_pos = s1_state.get('trend', 0)
-        trade_pnl = s1_pos * daily_return
+        
+        # Get decay weight
+        entry_date = s1_state.get('entry_date')
+        if entry_date:
+            entry_dt = datetime.fromisoformat(entry_date.replace('Z', '+00:00'))
+            days_since = (datetime.now(timezone.utc) - entry_dt).days
+            decay_weight = calculate_decay_weight(days_since)
+        else:
+            decay_weight = 1.0
+        
+        actual_pos = s1_pos * decay_weight
+        trade_pnl = actual_pos * daily_return
         
         s1_state['trade_equity'] = s1_state.get('trade_equity', 1.0) * (1 + trade_pnl)
         if s1_state['trade_equity'] > s1_state.get('peak_equity', 1.0):
@@ -587,4 +591,34 @@ def main():
     log.info("S2: SMA 400 with proximity sizing + 27% trailing stop")
     log.info("Trading BTC/EUR on Kraken Futures")
     
-    if not 
+    if not smoke_test(api):
+        log.error("Smoke test failed, exiting")
+        sys.exit(1)
+    
+    state = load_state()
+    save_state(state)
+    
+    if RUN_TRADE_NOW:
+        log.info("RUN_TRADE_NOW=true – executing trade now")
+        try:
+            daily_trade(api)
+        except Exception as exc:
+            log.exception("Immediate trade failed: %s", exc)
+
+    log.info("Starting web dashboard on port %s", os.getenv("PORT", 8080))
+    time.sleep(1)
+    subprocess.Popen([sys.executable, "web_planner.py"])
+
+    while True:
+        wait_until_00_01_utc()
+        try:
+            daily_trade(api)
+        except KeyboardInterrupt:
+            log.info("Interrupted")
+            break
+        except Exception as exc:
+            log.exception("Daily trade failed: %s", exc)
+
+
+if __name__ == "__main__":
+    main()
